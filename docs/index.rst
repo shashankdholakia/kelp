@@ -18,6 +18,7 @@ package written in Python. The source code is available on
   kelp/gettingstarted.rst
   kelp/interactive.rst
   kelp/optimization.rst
+  kelp/jax_higher_order.rst
   kelp/reflected.rst
   kelp/index.rst
 

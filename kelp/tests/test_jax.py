@@ -1,6 +1,9 @@
 import numpy as np
 import pytest
 import astropy.units as u
+import jax
+import jax.numpy as jnp
+from scipy.special import hermite
 
 from ..core import Model
 from ..registries import Planet, Filter
@@ -8,6 +11,7 @@ from ..jax import (
     reflected_phase_curve as refl_jax,
     thermal_phase_curve as therm_jax
 )
+from ..jax.jax import H, h_ml, h_ml_sum, h_ml_sum_theano
 
 
 @pytest.mark.parametrize("omega, g",
@@ -46,12 +50,140 @@ def test_jax_vs_cython_thermal(C_11, hotspot_offset):
     theta2d, phi2d = np.meshgrid(theta, phi)
 
     thermal_pc_jax, T = therm_jax(
-        xi, -0.8, 4.5, 0.575, C_11, planet.T_s, planet.a, planet.rp_a, 0,
+        xi, hotspot_offset, 4.5, 0.575, C_11, planet.T_s, planet.a, planet.rp_a, 0,
         theta2d, phi2d, filt.wavelength.to(u.m).value, filt.transmittance, f
     )
 
-    m = Model(-0.8, 0.575, 4.5, 0, [[0], [0, C_11, 0]], 1,
+    m = Model(hotspot_offset, 0.575, 4.5, 0, [[0], [0, C_11, 0]], 1,
               planet.a, planet.rp_a, planet.T_s, filt=filt)
     thermal_pc_cython = 1e-6 * m.thermal_phase_curve(xi, f=f).flux
 
     np.testing.assert_allclose(thermal_pc_jax, thermal_pc_cython, rtol=0.01)
+
+
+def _grid(n_theta=10, n_phi=100):
+    phi = np.linspace(-2 * np.pi, 2 * np.pi, n_phi)
+    theta = np.linspace(0, np.pi, n_theta)
+    return np.meshgrid(theta, phi)
+
+
+def _random_C_ml(lmax, seed=0):
+    # ragged, row l has 2l+1 entries, including negative-m (wrapped) entries
+    rng = np.random.default_rng(seed)
+    return [[0]] + [list(rng.uniform(-0.1, 0.1, 2 * l + 1))
+                    for l in range(1, lmax + 1)]
+
+
+def _thermal_setup():
+    planet = Planet.from_name('HD 189733')
+    filt = Filter.from_name('IRAC 1')
+    filt.bin_down(5)
+    return planet, filt
+
+
+@pytest.mark.parametrize("l", range(0, 21))
+def test_hermite_vs_scipy(l):
+    theta = np.linspace(0, np.pi, 50)
+    alpha = 0.6
+    expected = hermite(l)(alpha * np.cos(theta))
+    np.testing.assert_allclose(H(l, theta, alpha), expected,
+                               rtol=1e-8, atol=1e-8)
+
+
+def test_h_ml_m0_zeros():
+    theta2d, phi2d = _grid()
+    out = h_ml(4.5, 0.6, theta2d, phi2d, 0.3, m=0, l=2)
+    assert out.shape == theta2d.shape
+    assert np.all(np.asarray(out) == 0)
+
+
+@pytest.mark.parametrize("lmax", (1, 2, 3))
+def test_h_ml_sum_vs_cython(lmax):
+    from ..fast import _h_ml_sum_cy
+    theta2d, phi2d = _grid()
+    C_ml = _random_C_ml(lmax, seed=lmax)
+    hotspot_offset, omega_drag, alpha = -0.8, 4.5, 0.575
+
+    cy = _h_ml_sum_cy(hotspot_offset, omega_drag, alpha, theta2d, phi2d,
+                      C_ml, lmax)
+    jx = np.asarray(h_ml_sum(hotspot_offset, omega_drag, alpha,
+                             theta2d, phi2d, C_ml))
+    assert cy.shape == jx.T.shape
+    print("max |jax - cython| =", np.max(np.abs(jx.T - cy)))
+    # Cython evaluates in float32 (relative precision ~6e-8 per operation,
+    # accumulating over a few terms), so allow rtol=1e-5; the atol covers
+    # near-zero sums where cancellation dominates the relative error.
+    np.testing.assert_allclose(jx.T, cy, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("lmax", (2, 3))
+def test_jax_vs_cython_thermal_higher_order(lmax):
+    f = 0.68
+    hotspot_offset = -0.8
+    planet, filt = _thermal_setup()
+    xi = np.linspace(-np.pi, np.pi, 100)
+    theta2d, phi2d = _grid()
+    C_ml = _random_C_ml(lmax, seed=10 + lmax)
+
+    thermal_pc_jax, T = therm_jax(
+        xi, hotspot_offset, 4.5, 0.575, C_ml, planet.T_s, planet.a,
+        planet.rp_a, 0, theta2d, phi2d, filt.wavelength.to(u.m).value,
+        filt.transmittance, f
+    )
+    m = Model(hotspot_offset, 0.575, 4.5, 0, C_ml, lmax,
+              planet.a, planet.rp_a, planet.T_s, filt=filt)
+    thermal_pc_cython = 1e-6 * m.thermal_phase_curve(xi, f=f).flux
+
+    np.testing.assert_allclose(thermal_pc_jax, thermal_pc_cython, rtol=0.01)
+
+
+def test_scalar_C_ml_matches_nested():
+    theta2d, phi2d = _grid()
+    scalar = h_ml_sum(-0.8, 4.5, 0.575, theta2d, phi2d, 0.2)
+    nested = h_ml_sum(-0.8, 4.5, 0.575, theta2d, phi2d, [[0], [0, 0.2, 0]])
+    legacy = h_ml_sum_theano(-0.8, 4.5, 0.575, theta2d, phi2d, 0.2)
+    np.testing.assert_array_equal(scalar, nested)
+    np.testing.assert_array_equal(scalar, legacy)
+
+    planet, filt = _thermal_setup()
+    xi = np.linspace(-np.pi, np.pi, 20)
+    args = (planet.T_s, planet.a, planet.rp_a, 0, theta2d, phi2d,
+            filt.wavelength.to(u.m).value, filt.transmittance, 0.68)
+    pc_scalar = therm_jax(xi, -0.8, 4.5, 0.575, 0.2, *args)[0]
+    pc_nested = therm_jax(xi, -0.8, 4.5, 0.575, [[0], [0, 0.2, 0]], *args)[0]
+    np.testing.assert_array_equal(pc_scalar, pc_nested)
+
+
+def test_jit_and_grad_wrt_C_ml():
+    theta2d, phi2d = _grid()
+    planet, filt = _thermal_setup()
+    xi = np.linspace(-np.pi, np.pi, 20)
+    wl = filt.wavelength.to(u.m).value
+
+    def flux_sum(c11, c21, c2m1):
+        C_ml = [[0], [0, c11, 0], [0, c21, 0.01, 0, c2m1]]
+        pc, _ = therm_jax(xi, -0.8, 4.5, 0.575, C_ml, planet.T_s, planet.a,
+                          planet.rp_a, 0, theta2d, phi2d, wl,
+                          filt.transmittance, 0.68)
+        return jnp.sum(pc)
+
+    val = jax.jit(flux_sum)(0.2, 0.05, -0.03)
+    assert np.isfinite(val)
+    grads = jax.jit(jax.grad(flux_sum, argnums=(0, 1, 2)))(0.2, 0.05, -0.03)
+    assert all(np.isfinite(g) for g in grads)
+    assert all(g != 0 for g in grads)
+
+
+@pytest.mark.parametrize("bad", ([[0], [0, 0.1]],
+                                 [[0, 0], [0, 0.1, 0]],
+                                 [[0], [0, 0.1, 0], [0, 0, 0]]))
+def test_bad_row_length_raises(bad):
+    theta2d, phi2d = _grid()
+    with pytest.raises(ValueError):
+        h_ml_sum(-0.8, 4.5, 0.575, theta2d, phi2d, bad)
+
+
+def test_dense_array_rejected():
+    theta2d, phi2d = _grid()
+    with pytest.raises(ValueError):
+        h_ml_sum(-0.8, 4.5, 0.575, theta2d, phi2d, np.zeros((3, 3)))

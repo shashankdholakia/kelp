@@ -2,10 +2,12 @@ import numpy as np
 from numpy import pi as pi64
 from jax import numpy as jnp
 from jax import config
+from jax.core import Tracer
 config.update('jax_enable_x64', True)
 
 __all__ = [
     'thermal_phase_curve',
+    'h_ml_sum',
     'reflected_phase_curve',
     'reflected_phase_curve_inhomogeneous'
 ]
@@ -58,6 +60,32 @@ def tilda_mu(theta, alpha):
     return alpha * mu(theta)
 
 
+def _hermite_stack(n_max, x):
+    r"""
+    Physicists' Hermite polynomials :math:`H_n(x)` for all orders
+    :math:`n = 0, ..., n_{max}`, from the recurrence
+    :math:`H_{n+1} = 2 x H_n - 2 n H_{n-1}`.
+
+    Parameters
+    ----------
+    n_max : int
+        Highest order to compute
+    x : `~numpy.ndarray`
+        Argument of the polynomials
+
+    Returns
+    -------
+    stack : list of `~numpy.ndarray`
+        ``stack[n]`` is :math:`H_n(x)`, for ``n`` in ``0..n_max``.
+    """
+    stack = [jnp.ones_like(x)]
+    if n_max >= 1:
+        stack.append(two * x)
+    for n in range(1, n_max):
+        stack.append(two * x * stack[n] - two * n * stack[n - 1])
+    return stack
+
+
 def H(l, theta, alpha):
     r"""
     Hermite Polynomials in :math:`\tilde{\mu}(\theta)`.
@@ -65,7 +93,7 @@ def H(l, theta, alpha):
     Parameters
     ----------
     l : int
-        Implemented through :math:`\ell \leq 7`.
+        Order of the polynomial; any non-negative integer.
     theta : float
         Angle :math:`\theta`
     alpha : float
@@ -76,14 +104,27 @@ def H(l, theta, alpha):
     result : `~numpy.ndarray`
         Hermite Polynomial evaluated at angles :math:`\theta`.
     """
-    if l == 0:
-        return 1
-    elif l == 1:
-        return two * tilda_mu(theta, alpha)
-    elif l == 2:
-        return (two + two) * tilda_mu(theta, alpha) ** 2 - two
-    else:
-        raise NotImplementedError()
+    return _hermite_stack(int(l), tilda_mu(theta, alpha))[int(l)]
+
+
+def _h_ml_term(omega_drag, alpha, theta, phi, C, m, l, hermite, gauss):
+    """
+    One :math:`h_{m\\ell}` term given precomputed Hermite polynomials
+    (``hermite[n]`` for n in 0..l+1) and the Gaussian factor ``gauss``.
+    """
+    if m == 0:
+        return jnp.zeros(jnp.broadcast_shapes(jnp.shape(theta),
+                                              jnp.shape(phi)))
+    t_mu = tilda_mu(theta, alpha)
+    prefactor = (C /
+                 (jnp.power(omega_drag, two) *
+                  jnp.power(alpha, two * two) +
+                  jnp.power(m, two)) * gauss)
+
+    return prefactor * (mu(theta) * m * hermite[l] * jnp.cos(m * phi) +
+                        alpha * omega_drag * (t_mu * hermite[l] -
+                                              hermite[l + 1]) *
+                        jnp.sin(m * phi))
 
 
 def h_ml(omega_drag, alpha, theta, phi, C_11, m=one, l=one):
@@ -97,51 +138,122 @@ def h_ml(omega_drag, alpha, theta, phi, C_11, m=one, l=one):
     alpha : float
         Dimensionless fluid number
     m : int
-        Spherical harmonic ``m`` index
+        Spherical harmonic ``m`` index; any integer. ``m=0`` gives zeros.
     l : int
-        Spherical harmonic ``l`` index
+        Spherical harmonic ``l`` index; any non-negative integer.
     theta : `~numpy.ndarray`
         Latitudinal coordinate
     phi : `~numpy.ndarray`
         Longitudinal coordinate
     C_11 : float
-        Spherical harmonic coefficient
+        Spherical harmonic coefficient (of the ``m``, ``l`` term)
 
     Returns
     -------
     hml : `~numpy.ndarray`
         :math:`h_{m\ell}` basis function.
     """
-    prefactor = (C_11 /
-                 (jnp.power(omega_drag, two) *
-                  jnp.power(alpha, two * two) +
-                  jnp.power(m, two)) *
-                 jnp.exp(-jnp.power(tilda_mu(theta, alpha), two) * half))
+    m_int, l_int = int(m), int(l)
+    t_mu = tilda_mu(theta, alpha)
+    hermite = _hermite_stack(l_int + 1, t_mu)
+    gauss = jnp.exp(-jnp.power(t_mu, two) * half)
+    return _h_ml_term(omega_drag, alpha, theta, phi, C_11, m_int, l_int,
+                      hermite, gauss)
 
-    result = prefactor * (mu(theta) * m * H(l, theta, alpha) * jnp.cos(m * phi) +
-                          alpha * omega_drag * (tilda_mu(theta, alpha) *
-                                                H(l, theta, alpha) -
-                                                H(l + one, theta, alpha)) *
-                          jnp.sin(m * phi))
-    return result
+
+def _is_concrete_zero(c):
+    """
+    True only if ``c`` is a concrete (non-traced) number equal to zero
+    """
+    if isinstance(c, Tracer):
+        return False
+    try:
+        return bool(c == 0)
+    except Exception:
+        return False
+
+
+def _validate_C_ml(C_ml):
+    """
+    Return ``C_ml`` as a ragged nested list, promoting a scalar to
+    ``[[0], [0, C_ml, 0]]``, after checking that row ``l`` has ``2l+1``
+    entries.
+    """
+    if not isinstance(C_ml, (list, tuple)):
+        if jnp.ndim(C_ml) != 0:
+            raise ValueError("C_ml must be a scalar or a ragged nested list "
+                             "(row l with 2l+1 entries), not an array.")
+        return [[0], [0, C_ml, 0]]
+
+    for l, row in enumerate(C_ml):
+        if not isinstance(row, (list, tuple)) or len(row) != 2 * l + 1:
+            raise ValueError(
+                f"Row l={l} of C_ml must be a list with 2l+1={2 * l + 1} "
+                f"entries, got {row!r}.")
+    return C_ml
+
+
+def h_ml_sum(hotspot_offset, omega_drag, alpha, theta2d, phi2d, C_ml):
+    r"""
+    Sum of the :math:`h_{m\ell}` basis functions for
+    :math:`\ell = 1, ..., \ell_{max}`, :math:`m = -\ell, ..., \ell`.
+
+    The loops over ``l`` and ``m`` are unrolled at trace time, so
+    ``lmax = len(C_ml) - 1`` is static, while the entries of ``C_ml`` may be
+    traced values. Terms whose coefficient is a concrete zero are skipped.
+
+    Parameters
+    ----------
+    hotspot_offset : float
+        Angle of hotspot offset [radians]
+    omega_drag : float
+        Dimensionless drag
+    alpha : float
+        Dimensionless fluid number
+    theta2d : `~numpy.ndarray`
+        Latitudinal coordinate
+    phi2d : `~numpy.ndarray`
+        Longitudinal coordinate
+    C_ml : float or list of lists
+        Either a scalar (the power in :math:`m=\ell=1`, equivalent to
+        ``[[0], [0, C_ml, 0]]``), or a ragged nested list in the same format
+        as `~kelp.Model`, indexed ``C_ml[l][m]`` where row ``l`` has ``2l+1``
+        entries and negative ``m`` wraps around as in Python indexing, i.e.
+        row ``l`` is ``[C_l0, C_l1, ..., C_ll, C_l-l, ..., C_l-1]``.
+
+    Returns
+    -------
+    hml_sum : `~numpy.ndarray`
+        Sum of the basis functions, with the shape of ``theta2d``/``phi2d``.
+    """
+    C = _validate_C_ml(C_ml)
+    lmax = len(C) - 1
+    phase_offset = half * pi
+    phi = phi2d + phase_offset + hotspot_offset
+
+    t_mu = tilda_mu(theta2d, alpha)
+    hermite = _hermite_stack(lmax + 1, t_mu)
+    gauss = jnp.exp(-jnp.power(t_mu, two) * half)
+
+    total = jnp.zeros(jnp.broadcast_shapes(jnp.shape(theta2d),
+                                           jnp.shape(phi)))
+    for l in range(1, lmax + 1):
+        for m in range(-l, l + 1):
+            Cml = C[l][m]  # negative m wraps around, as in the Cython code
+            if m == 0 or _is_concrete_zero(Cml):
+                continue
+            total = total + _h_ml_term(omega_drag, alpha, theta2d, phi, Cml,
+                                       m, l, hermite, gauss)
+    return total
 
 
 def h_ml_sum_theano(hotspot_offset, omega_drag, alpha,
                     theta2d, phi2d, C_11):
     """
-    Cythonized implementation of the quadruple loop over: theta's, phi's,
-    l's and m's to compute the h_ml_sum term
+    Backward-compatible wrapper around `h_ml_sum` for the :math:`m=\\ell=1`
+    term only, with scalar ``C_11``.
     """
-    phase_offset = half * pi
-
-    hml_sum = h_ml(omega_drag, alpha,
-                   theta2d,
-                   phi2d +
-                   phase_offset +
-                   hotspot_offset,
-                   C_11)
-
-    return hml_sum
+    return h_ml_sum(hotspot_offset, omega_drag, alpha, theta2d, phi2d, C_11)
 
 
 def blackbody_lambda(lam, temperature):
@@ -201,7 +313,7 @@ def integrate_planck(filt_wavelength, filt_trans,
 
 
 def thermal_phase_curve(xi, hotspot_offset, omega_drag,
-                        alpha, C_11, T_s, a_rs, rp_a, A_B,
+                        alpha, C_ml, T_s, a_rs, rp_a, A_B,
                         theta2d, phi2d, filt_wavelength,
                         filt_transmittance, f):
     r"""
@@ -222,8 +334,19 @@ def thermal_phase_curve(xi, hotspot_offset, omega_drag,
         Dimensionless drag frequency
     alpha : float
         Dimensionless fluid number
-    C_11 : float
-        Spherical harmonic power in the :math:`m=1\,\ell=1` mode
+    C_ml : float or list of lists
+        Spherical harmonic power. Either a scalar, the power in the
+        :math:`m=1\,\ell=1` mode (equivalent to ``[[0], [0, C_ml, 0]]``), or
+        a ragged nested list in the `~kelp.Model` format, indexed
+        ``C_ml[l][m]``, where row ``l`` has ``2l+1`` entries and negative
+        ``m`` wraps around as in Python indexing. ``lmax = len(C_ml) - 1``.
+        Entries may be traced values. For example, for ``lmax=2``::
+
+            C_ml = [[0],
+                    [0, C_11, 0],
+                    [0, C_21, C_22, C_2m2, C_2m1]]
+
+        where the last row is ``[C_20, C_21, C_22, C_2-2, C_2-1]``.
     T_s : float [K]
         Stellar effective temperature
     a_rs : float
@@ -268,11 +391,11 @@ def thermal_phase_curve(xi, hotspot_offset, omega_drag,
     filt_wavelength_tt = filt_wavelength[None, None, None, :]
     filt_transmittance_tt = filt_transmittance[None, None, None, :]
 
-    h_ml_sum = h_ml_sum_theano(hotspot_offset, omega_drag,
-                               alpha, theta2d_tt, phi2d_tt, C_11)
+    hml_sum = h_ml_sum(hotspot_offset, omega_drag,
+                       alpha, theta2d_tt, phi2d_tt, C_ml)
     T_eq = f * T_s * jnp.power(a_rs, -half)
 
-    T = T_eq * jnp.power(one - A_B, half * half) * (one + h_ml_sum)
+    T = T_eq * jnp.power(one - A_B, half * half) * (one + hml_sum)
 
     rp_rs = rp_a * a_rs
     int_bb = integrate_planck(filt_wavelength_tt,
